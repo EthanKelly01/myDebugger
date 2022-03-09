@@ -7,3 +7,4 @@ myDebugger/myDebugger.sln
 !*.hpp
 !*.md
 !*.txt
+!*.lib

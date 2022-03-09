@@ -1,3 +1,5 @@
+#pragma once
+
 //Author: E. Kelly
 //Date Started: 05/03/2022
 //Ver. 0.1
@@ -14,6 +16,7 @@
 
 namespace Debugger {
 
+#pragma region type_name
     //returns the demangled type name of the variable x
     //call `type_name<decltype(x)>()`
     template <class T> std::string type_name() {
@@ -32,7 +35,9 @@ namespace Debugger {
         else if (std::is_rvalue_reference<T>::value) r += "&&";
         return r;
     }
+#pragma endregion type_name
 
+#pragma region clock_cycles
     //Find clock cycles
 #ifdef _WIN32 //  Windows
     uint64_t rdtsc() { return __rdtsc(); }
@@ -43,8 +48,16 @@ namespace Debugger {
         return ((uint64_t)hi << 32) | lo;
     }
 #endif
+#pragma endregion clock_cycles
 
     typedef std::pair<uint64_t, std::chrono::steady_clock::time_point> timer;
+
+    //Benchmarks a function
+    template<typename Duration = std::chrono::microseconds, typename F, typename ... Args> typename Duration::rep benchmark(F&& fun, Args&&... args) {
+        const timer beg = { rdtsc(), std::chrono::high_resolution_clock::now() };
+        std::forward<F>(fun)(std::forward<Args>(args)...);
+        return std::chrono::duration_cast<Duration>(std::chrono::high_resolution_clock::now() - beg.second).count();
+    }
 
     //returns a benchmarker object with current clock cycles and time
     inline timer getBench() { return { rdtsc(), std::chrono::steady_clock::now() }; }
@@ -60,11 +73,4 @@ namespace Debugger {
         else if (type == "class std::chrono::duration<int,struct std::ratio<3600,1> >") type = "hours";
         std::cout << "\nClock cycles: " << rdtsc() - start.first << ", " << type << ": " << std::chrono::duration_cast<Duration>(std::chrono::steady_clock::now() - start.second).count() << "\n";
     }
-}
-
-using namespace Debugger;
-
-//TEMP (testing)
-int main() {
-    endBench<std::chrono::microseconds>(getBench());
 }
