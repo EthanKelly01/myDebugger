@@ -1,5 +1,3 @@
-#pragma once
-
 //Author: E. Kelly
 //Date Started: 05/03/2022
 //Ver. 0.1
@@ -8,11 +6,15 @@
 //Note: this project uses code from external sources, it is not all original
 //https://stackoverflow.com/questions/31391914/timing-in-an-elegant-way-in-c
 //https://stackoverflow.com/questions/63166/how-to-determine-cpu-and-memory-consumption-from-inside-a-process
+//https://docs.microsoft.com/en-us/windows/win32/perfctrs/writing-performance-data-to-a-log-file?redirectedfrom=MSDN
+
+#pragma once
 
 #include <iostream> //basic IO
 #include <stdint.h> //used for clock cycle benchmarking
 #include <intrin.h>
 #include <chrono> //time benchmarking
+#include <tuple> //for memory containers
 
 namespace Debugger {
 
@@ -37,30 +39,29 @@ namespace Debugger {
     }
 #pragma endregion type_name
 
-#pragma region clock_cycles
+#pragma region timing
     //Find clock cycles
 #ifdef _WIN32 //  Windows
-    uint64_t rdtsc() { return __rdtsc(); }
+    uint64_t clocks() { return __rdtsc(); }
 #else //  Linux/GCC
-    uint64_t rdtsc() {
+    uint64_t clocks() {
         unsigned int lo, hi;
         __asm__ __volatile__("rdtsc" : "=a" (lo), "=d" (hi));
         return ((uint64_t)hi << 32) | lo;
     }
 #endif
-#pragma endregion clock_cycles
 
     typedef std::pair<uint64_t, std::chrono::steady_clock::time_point> timer;
 
     //Benchmarks a function
     template<typename Duration = std::chrono::microseconds, typename F, typename ... Args> typename Duration::rep benchmark(F&& fun, Args&&... args) {
-        const timer beg = { rdtsc(), std::chrono::high_resolution_clock::now() };
+        const timer beg = { clocks(), std::chrono::high_resolution_clock::now() };
         std::forward<F>(fun)(std::forward<Args>(args)...);
         return std::chrono::duration_cast<Duration>(std::chrono::high_resolution_clock::now() - beg.second).count();
     }
 
     //returns a benchmarker object with current clock cycles and time
-    inline timer getBench() { return { rdtsc(), std::chrono::steady_clock::now() }; }
+    inline timer getBench() { return { clocks(), std::chrono::steady_clock::now() }; }
 
     //prints total clock cycles and nanoseconds since the benchmark passed
     template<typename Duration = std::chrono::microseconds> inline void endBench(timer start) { //fix time output to duration
@@ -71,6 +72,119 @@ namespace Debugger {
         else if (type == "class std::chrono::duration<__int64,struct std::ratio<1,1000000> >") type = "microseconds";
         else if (type == "class std::chrono::duration<int,struct std::ratio<60,1> >") type = "minutes";
         else if (type == "class std::chrono::duration<int,struct std::ratio<3600,1> >") type = "hours";
-        std::cout << "\nClock cycles: " << rdtsc() - start.first << ", " << type << ": " << std::chrono::duration_cast<Duration>(std::chrono::steady_clock::now() - start.second).count() << "\n";
+        std::cout << "\nClock cycles: " << clocks() - start.first << ", " << type << ": " << std::chrono::duration_cast<Duration>(std::chrono::steady_clock::now() - start.second).count() << "\n";
     }
+#pragma endregion timing
+
+#pragma region Memory/CPU
+
+    typedef std::tuple<unsigned long long, unsigned long long, unsigned long> memory;
+#ifdef _MSC_VER
+#include "windows.h"
+#include "psapi.h" //gets info on current process: "process status API"
+
+#include <pdh.h>
+#include <pdhmsg.h>
+
+#pragma comment(lib,"pdh.lib")
+
+    static PDH_HQUERY cpuQuery;
+    static PDH_HCOUNTER cpuTotal;
+
+    static ULARGE_INTEGER lastCPU, lastSysCPU, lastUserCPU;
+    static int numProcessors;
+    static HANDLE self;
+
+    //returns tuple<ulonglong, ulonglong, ulong> total virt mem, virt mem used, and virt mem used by the process
+    memory getVirtMem() {
+        MEMORYSTATUSEX memInfo;
+        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+        GlobalMemoryStatusEx(&memInfo);
+        PROCESS_MEMORY_COUNTERS_EX pmc;
+        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
+
+        return { memInfo.ullTotalPageFile, memInfo.ullTotalPageFile - memInfo.ullAvailPageFile, pmc.PrivateUsage };
+    }
+    //returns tuple<ulonglong, ulonglong, ulong> total RAM, RAM used, and RAM used by the process
+    memory getPhysMem() {
+        MEMORYSTATUSEX memInfo;
+        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+        GlobalMemoryStatusEx(&memInfo);
+        PROCESS_MEMORY_COUNTERS_EX pmc;
+        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
+
+        return { memInfo.ullTotalPhys, memInfo.ullTotalPhys - memInfo.ullAvailPhys, pmc.WorkingSetSize };
+    }
+
+    void initCPU() {
+        PDH_STATUS a = PdhOpenQuery(NULL, NULL, &cpuQuery);
+        PDH_STATUS i = PdhAddEnglishCounter(cpuQuery, L"\\Processor(_Total)\\% Processor Time", NULL, &cpuTotal);
+        PdhCollectQueryData(cpuQuery);
+
+        SYSTEM_INFO sysInfo;
+        FILETIME ftime, fsys, fuser;
+
+        GetSystemInfo(&sysInfo);
+        numProcessors = sysInfo.dwNumberOfProcessors;
+
+        GetSystemTimeAsFileTime(&ftime);
+        memcpy(&lastCPU, &ftime, sizeof(FILETIME));
+
+        self = GetCurrentProcess();
+        GetProcessTimes(self, &ftime, &ftime, &fsys, &fuser);
+        memcpy(&lastSysCPU, &fsys, sizeof(FILETIME));
+        memcpy(&lastUserCPU, &fuser, sizeof(FILETIME));
+    }
+
+    double getTotalCPU() {
+        PDH_FMT_COUNTERVALUE counterVal;
+
+        PdhCollectQueryData(cpuQuery);
+        PdhGetFormattedCounterValue(cpuTotal, PDH_FMT_DOUBLE, NULL, &counterVal);
+        return counterVal.doubleValue;
+    }
+
+    double getProgCPU() {
+        FILETIME ftime, fsys, fuser;
+        ULARGE_INTEGER now, sys, user;
+        double percent;
+
+        GetSystemTimeAsFileTime(&ftime);
+        memcpy(&now, &ftime, sizeof(FILETIME));
+
+        GetProcessTimes(self, &ftime, &ftime, &fsys, &fuser);
+        memcpy(&sys, &fsys, sizeof(FILETIME));
+        memcpy(&user, &fuser, sizeof(FILETIME));
+        percent = (sys.QuadPart - lastSysCPU.QuadPart) +
+            (user.QuadPart - lastUserCPU.QuadPart);
+        percent /= (now.QuadPart - lastCPU.QuadPart);
+        percent /= numProcessors;
+        lastCPU = now;
+        lastUserCPU = user;
+        lastSysCPU = sys;
+
+        return percent * 100;
+    }
+
+    void runDiag() {
+        MEMORYSTATUSEX memInfo;
+        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+        GlobalMemoryStatusEx(&memInfo);
+        PROCESS_MEMORY_COUNTERS_EX pmc;
+        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
+
+        std::cout << "Virtual Memory\n\tUsing: " << pmc.PrivateUsage * 100.f / memInfo.ullAvailPageFile << "% of available.\n\tSystem using: " << (memInfo.ullTotalPageFile - memInfo.ullAvailPageFile) * 100.f / memInfo.ullTotalPageFile
+            << "% of total.\nRAM\n\tUsing: " << pmc.WorkingSetSize * 100.f / memInfo.ullAvailPhys << "% of available.\n\tSystem using: " << (memInfo.ullTotalPhys - memInfo.ullAvailPhys) * 100.f / memInfo.ullTotalPhys
+            << "% of total.\n";
+        PDH_FMT_COUNTERVALUE counterVal;
+
+        PdhCollectQueryData(cpuQuery);
+        PdhGetFormattedCounterValue(cpuTotal, PDH_FMT_DOUBLE, NULL, &counterVal);
+        //return counterVal.doubleValue;
+        if (counterVal.doubleValue > 0) std::cout << "CPU\n\tUsing: " << getProgCPU() << "%\n\tSystem using: " << counterVal.doubleValue << "%\n";
+    }
+#else
+
+#endif
+#pragma endregion Memory/CPU 
 }
