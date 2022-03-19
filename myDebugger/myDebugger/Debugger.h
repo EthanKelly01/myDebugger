@@ -17,7 +17,6 @@
 #include <tuple> //for memory containers
 
 namespace Debugger {
-
 #pragma region type_name
     //returns the demangled type name of the variable x
     //call `type_name<decltype(x)>()`
@@ -77,8 +76,11 @@ namespace Debugger {
 #pragma endregion timing
 
 #pragma region Memory/CPU
-
-    typedef std::tuple<unsigned long long, unsigned long long, unsigned long> memory;
+    struct memory {
+        unsigned long long virtTotal, virtUsed, virtProg;
+        unsigned long long ramTotal, ramUsed, ramProg;
+        double cpuTotal, cpuProg;
+    };
 #ifdef _MSC_VER
 #include "windows.h"
 #include "psapi.h" //gets info on current process: "process status API"
@@ -88,33 +90,12 @@ namespace Debugger {
 
 #pragma comment(lib,"pdh.lib")
 
+    //cpu stuff
     static PDH_HQUERY cpuQuery;
     static PDH_HCOUNTER cpuTotal;
-
     static ULARGE_INTEGER lastCPU, lastSysCPU, lastUserCPU;
     static int numProcessors;
     static HANDLE self;
-
-    //returns tuple<ulonglong, ulonglong, ulong> total virt mem, virt mem used, and virt mem used by the process
-    memory getVirtMem() {
-        MEMORYSTATUSEX memInfo;
-        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
-        GlobalMemoryStatusEx(&memInfo);
-        PROCESS_MEMORY_COUNTERS_EX pmc;
-        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
-
-        return { memInfo.ullTotalPageFile, memInfo.ullTotalPageFile - memInfo.ullAvailPageFile, pmc.PrivateUsage };
-    }
-    //returns tuple<ulonglong, ulonglong, ulong> total RAM, RAM used, and RAM used by the process
-    memory getPhysMem() {
-        MEMORYSTATUSEX memInfo;
-        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
-        GlobalMemoryStatusEx(&memInfo);
-        PROCESS_MEMORY_COUNTERS_EX pmc;
-        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
-
-        return { memInfo.ullTotalPhys, memInfo.ullTotalPhys - memInfo.ullAvailPhys, pmc.WorkingSetSize };
-    }
 
     void initCPU() {
         PDH_STATUS a = PdhOpenQuery(NULL, NULL, &cpuQuery);
@@ -136,18 +117,9 @@ namespace Debugger {
         memcpy(&lastUserCPU, &fuser, sizeof(FILETIME));
     }
 
-    double getTotalCPU() {
-        PDH_FMT_COUNTERVALUE counterVal;
-
-        PdhCollectQueryData(cpuQuery);
-        PdhGetFormattedCounterValue(cpuTotal, PDH_FMT_DOUBLE, NULL, &counterVal);
-        return counterVal.doubleValue;
-    }
-
-    double getProgCPU() {
+    double getCPU() {
         FILETIME ftime, fsys, fuser;
         ULARGE_INTEGER now, sys, user;
-        double percent;
 
         GetSystemTimeAsFileTime(&ftime);
         memcpy(&now, &ftime, sizeof(FILETIME));
@@ -155,18 +127,36 @@ namespace Debugger {
         GetProcessTimes(self, &ftime, &ftime, &fsys, &fuser);
         memcpy(&sys, &fsys, sizeof(FILETIME));
         memcpy(&user, &fuser, sizeof(FILETIME));
-        percent = (sys.QuadPart - lastSysCPU.QuadPart) +
-            (user.QuadPart - lastUserCPU.QuadPart);
-        percent /= (now.QuadPart - lastCPU.QuadPart);
-        percent /= numProcessors;
+        double percent = (numProcessors > 0 && now.QuadPart - lastCPU.QuadPart != 0) ? ((((sys.QuadPart - lastSysCPU.QuadPart) + (user.QuadPart - lastUserCPU.QuadPart)) / (now.QuadPart - lastCPU.QuadPart)) / numProcessors) * 100 : -0.1;
         lastCPU = now;
         lastUserCPU = user;
         lastSysCPU = sys;
 
-        return percent * 100;
+        return percent;
     }
 
-    void runDiag() {
+    memory getData() {
+        MEMORYSTATUSEX memInfo;
+        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+        GlobalMemoryStatusEx(&memInfo);
+        PROCESS_MEMORY_COUNTERS_EX pmc;
+        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
+
+        PDH_FMT_COUNTERVALUE counterVal;
+        PdhCollectQueryData(cpuQuery);
+        PdhGetFormattedCounterValue(cpuTotal, PDH_FMT_DOUBLE, NULL, &counterVal);
+
+        return { memInfo.ullTotalPageFile, memInfo.ullTotalPageFile - memInfo.ullAvailPageFile, pmc.PrivateUsage, memInfo.ullTotalPhys, memInfo.ullTotalPhys - memInfo.ullAvailPhys, pmc.WorkingSetSize, counterVal.doubleValue, getCPU() };
+    }
+
+    void compareData(memory pastData) {
+        memory curData = getData();
+        std::cout << "Virtual Memory consumption: " << static_cast<long>(curData.virtProg - pastData.virtProg) * 100.f / curData.virtTotal
+            << "%\nRAM consumption: " << static_cast<long>(curData.ramProg - pastData.ramProg) * 100.f / curData.ramTotal << "%\n";
+        if (curData.cpuProg > 0 && pastData.cpuProg > 0) std::cout << "CPU usage: " << curData.cpuProg - pastData.cpuProg << "%\n";
+    }
+
+    void printDiag() {
         MEMORYSTATUSEX memInfo;
         memInfo.dwLength = sizeof(MEMORYSTATUSEX);
         GlobalMemoryStatusEx(&memInfo);
@@ -174,14 +164,12 @@ namespace Debugger {
         GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
 
         std::cout << "Virtual Memory\n\tUsing: " << pmc.PrivateUsage * 100.f / memInfo.ullAvailPageFile << "% of available.\n\tSystem using: " << (memInfo.ullTotalPageFile - memInfo.ullAvailPageFile) * 100.f / memInfo.ullTotalPageFile
-            << "% of total.\nRAM\n\tUsing: " << pmc.WorkingSetSize * 100.f / memInfo.ullAvailPhys << "% of available.\n\tSystem using: " << (memInfo.ullTotalPhys - memInfo.ullAvailPhys) * 100.f / memInfo.ullTotalPhys
-            << "% of total.\n";
+            << "% of total.\nRAM\n\tUsing: " << pmc.WorkingSetSize * 100.f / memInfo.ullAvailPhys << "% of available.\n\tSystem using: " << (memInfo.ullTotalPhys - memInfo.ullAvailPhys) * 100.f / memInfo.ullTotalPhys << "% of total.\n";
         PDH_FMT_COUNTERVALUE counterVal;
 
         PdhCollectQueryData(cpuQuery);
         PdhGetFormattedCounterValue(cpuTotal, PDH_FMT_DOUBLE, NULL, &counterVal);
-        //return counterVal.doubleValue;
-        if (counterVal.doubleValue > 0) std::cout << "CPU\n\tUsing: " << getProgCPU() << "%\n\tSystem using: " << counterVal.doubleValue << "%\n";
+        if (counterVal.doubleValue > 0) std::cout << "CPU\n\tUsing: " << getCPU() << "%\n\tSystem using: " << counterVal.doubleValue << "%\n";
     }
 #else
 
